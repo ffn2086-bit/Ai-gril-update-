@@ -1,0 +1,143 @@
+name: Build Android APK
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'zulu'
+          java-version: '17'
+
+      - name: Set up Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: '3.35.x'
+          channel: 'stable'
+          cache: true
+
+      - name: Arrange files (works for flat or folder upload)
+        run: |
+          mkdir -p lib
+          if [ -f main.dart ]; then cp main.dart lib/main.dart; fi
+
+      - name: Write correct pubspec.yaml (fixes old speech_to_text)
+        run: |
+          cat > pubspec.yaml <<'PUBEOF'
+          name: ai_girlfriend
+          description: AI girlfriend voice chat app powered by Gemini
+          publish_to: none
+          version: 1.0.0+1
+          environment:
+            sdk: ">=3.0.0 <4.0.0"
+          dependencies:
+            flutter:
+              sdk: flutter
+            http: ^1.2.0
+            shared_preferences: ^2.2.0
+            speech_to_text: ^7.0.0
+            flutter_tts: ^4.0.0
+            audioplayers: ^6.1.0
+            path_provider: ^2.1.0
+            crypto: ^3.0.3
+          flutter:
+            uses-material-design: true
+          PUBEOF
+          rm -rf test
+
+      - name: Initialize Android Project Structure
+        run: flutter create . --project-name=ai_girlfriend --org=com.aigf --platforms=android
+
+      - name: Permissions, min SDK and Gradle fix
+        run: |
+          python3 - <<'PY'
+          import glob
+          p = "android/app/src/main/AndroidManifest.xml"
+          s = open(p).read()
+          if "RECORD_AUDIO" not in s:
+              perms = '''<uses-permission android:name="android.permission.INTERNET"/>
+              <uses-permission android:name="android.permission.RECORD_AUDIO"/>
+              <uses-permission android:name="android.permission.BLUETOOTH"/>
+              <uses-permission android:name="android.permission.BLUETOOTH_CONNECT"/>
+              <queries>
+                  <intent><action android:name="android.intent.action.TTS_SERVICE"/></intent>
+                  <intent><action android:name="android.speech.RecognitionService"/></intent>
+              </queries>
+              <application'''
+              s = s.replace("<application", perms, 1)
+              open(p, "w").write(s)
+          for g in glob.glob("android/app/build.gradle*"):
+              t = open(g).read().replace("flutter.minSdkVersion", "24")
+              open(g, "w").write(t)
+          agp9 = False
+          for sg in glob.glob("android/settings.gradle*"):
+              if 'com.android.application' in open(sg).read() and 'version "9' in open(sg).read():
+                  agp9 = True
+          if agp9:
+              with open("android/gradle.properties", "a") as f:
+                  f.write("\nandroid.newDsl=false\nandroid.builtInKotlin=false\nandroid.enableLegacyVariantApi=true\n")
+          print("patched, agp9 =", agp9)
+          PY
+
+      - name: Show versions
+        run: |
+          flutter --version
+          grep -rn "com.android.application" android/settings.gradle* || true
+
+      - name: Install dependencies
+        run: flutter pub get
+
+      - name: Analyze Dart code
+        continue-on-error: true
+        run: |
+          flutter analyze --no-fatal-infos --no-fatal-warnings 2>&1 | tee analyze.log || true
+          {
+            echo '### Dart code errors'
+            echo '```'
+            grep -E "error •|Error:" analyze.log | head -40
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Build APK (Release)
+        run: |
+          set -o pipefail
+          flutter build apk --release 2>&1 | tee build.log
+
+      - name: Show build errors
+        if: failure()
+        run: |
+          {
+            echo '### Build errors'
+            echo '```'
+            grep -n -i -E "What went wrong|error:|Execution failed|Could not|Unsupported|incompatible|requires|FAILURE" -A4 build.log | head -90
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          grep -n -i -E "What went wrong|error:|Execution failed|Could not" -A4 build.log | head -60 || true
+
+      - name: Upload build log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log
+          path: |
+            build.log
+            analyze.log
+          if-no-files-found: ignore
+
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: app-release
+          path: build/app/outputs/flutter-apk/app-release.apk
